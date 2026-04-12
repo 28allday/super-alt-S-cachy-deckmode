@@ -2,6 +2,12 @@
 
 Switch between KDE Plasma desktop and Steam Big Picture Gaming Mode with a keyboard shortcut. Built for Arch Linux and CachyOS.
 
+<p align="center">
+  <a href="https://youtu.be/lTEq_MmkYUU">
+    <img src="https://img.youtube.com/vi/lTEq_MmkYUU/0.jpg" width="700">
+  </a>
+</p>
+
 **Super+Alt+S** to enter Gaming Mode. **Super+Alt+R** to return to desktop.
 
 ## What it does
