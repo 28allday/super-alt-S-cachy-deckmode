@@ -192,9 +192,22 @@ check_nvidia_kernel_params() {
   local bootloader=""
   local config_file=""
 
-  if [ -f /boot/limine.conf ]; then
+  # Check /etc/default/limine first: it's readable by the user and is the
+  # source-of-truth on CachyOS/limine-mkinitcpio-hook installs. The ESP
+  # (/boot) is typically mounted with fmask=0077, so `[ -f /boot/limine.conf ]`
+  # returns false for non-root even when the file exists.
+  if [[ -f /etc/default/limine ]] || command -v limine-update >/dev/null 2>&1; then
+    bootloader="limine"
+    if sudo test -f /boot/limine.conf 2>/dev/null; then
+      config_file="/boot/limine.conf"
+    elif sudo test -f /boot/limine/limine.conf 2>/dev/null; then
+      config_file="/boot/limine/limine.conf"
+    else
+      config_file="/boot/limine.conf"
+    fi
+  elif sudo test -f /boot/limine.conf 2>/dev/null; then
     bootloader="limine"; config_file="/boot/limine.conf"
-  elif [ -f /boot/limine/limine.conf ]; then
+  elif sudo test -f /boot/limine/limine.conf 2>/dev/null; then
     bootloader="limine"; config_file="/boot/limine/limine.conf"
   elif sudo test -d /boot/loader/entries 2>/dev/null; then
     bootloader="systemd-boot"
@@ -249,6 +262,48 @@ check_nvidia_kernel_params() {
 configure_limine_nvidia() {
   local config_file="$1"
 
+  # CachyOS (and the standard limine-mkinitcpio-hook setup) regenerates
+  # /boot/limine.conf from /etc/default/limine on every mkinitcpio run, so a
+  # direct edit of limine.conf would be wiped on the next kernel update.
+  # Detect that setup and edit the source of truth instead.
+  if [[ -f /etc/default/limine ]] && command -v limine-update >/dev/null 2>&1; then
+    info "Detected limine-mkinitcpio-hook (CachyOS-style); editing /etc/default/limine"
+
+    sudo cp /etc/default/limine "/etc/default/limine.backup.$(date +%Y%m%d%H%M%S)" || {
+      err "Failed to backup /etc/default/limine"
+      return 1
+    }
+
+    if grep -qE '^KERNEL_CMDLINE\[default\].*nvidia-drm\.modeset=1' /etc/default/limine; then
+      info "nvidia-drm.modeset=1 already present in /etc/default/limine"
+    else
+      # Append nvidia-drm.modeset=1 inside the existing KERNEL_CMDLINE[default] quotes.
+      # The CachyOS default looks like:  KERNEL_CMDLINE[default]+="quiet ... root=UUID=..."
+      if sudo sed -i -E '/^KERNEL_CMDLINE\[default\][[:space:]]*\+?=/ s/"[[:space:]]*$/ nvidia-drm.modeset=1"/' /etc/default/limine \
+         && grep -qE '^KERNEL_CMDLINE\[default\].*nvidia-drm\.modeset=1' /etc/default/limine; then
+        info "Added nvidia-drm.modeset=1 to /etc/default/limine"
+      else
+        err "Failed to patch /etc/default/limine — please add nvidia-drm.modeset=1 to KERNEL_CMDLINE[default] manually"
+        show_manual_nvidia_instructions
+        return 1
+      fi
+    fi
+
+    info "Regenerating Limine config via limine-update..."
+    if sudo limine-update; then
+      echo ""
+      echo "  Limine config updated and regenerated"
+      echo "  Changes will take effect after reboot"
+      echo ""
+      NEEDS_REBOOT=1
+    else
+      err "limine-update failed — please run 'sudo limine-update' manually"
+      show_manual_nvidia_instructions
+    fi
+    return
+  fi
+
+  # Fallback: direct edit (vanilla Limine without the mkinitcpio hook).
   info "Backing up Limine config..."
   sudo cp "$config_file" "${config_file}.backup.$(date +%Y%m%d%H%M%S)" || {
     err "Failed to backup Limine config"
@@ -379,7 +434,11 @@ configure_systemd_boot_nvidia() {
 show_manual_nvidia_instructions() {
   cat <<'MSG'
   Manual configuration required:
-  Limine: Add nvidia-drm.modeset=1 to cmdline in /boot/limine.conf
+  Limine (CachyOS): Add nvidia-drm.modeset=1 inside the quotes of
+                    KERNEL_CMDLINE[default]+="..." in /etc/default/limine,
+                    then run: sudo limine-update
+  Limine (vanilla): Add nvidia-drm.modeset=1 to the 'cmdline:' line in
+                    /boot/limine.conf (root only)
   systemd-boot: Add to options in /boot/loader/entries/*.conf
   GRUB: Add to GRUB_CMDLINE_LINUX_DEFAULT, then run grub-mkconfig -o /boot/grub/grub.cfg
 MSG
@@ -560,9 +619,13 @@ check_steam_dependencies() {
     "gamescope"
     "mangohud"
     "lib32-mangohud"
-    "proton-ge-custom-bin"
     "udisks2"
   )
+  # NOTE: proton-ge-custom-bin removed from this list — installed directly
+  # from GitHub releases by install_proton_ge_from_github() below.
+  # The AUR pkg is just a thin wrapper that downloads the same tarball, and
+  # AUR's git backend has been unreliable. GitHub releases path bypasses
+  # AUR entirely (same approach protonup-qt/protonplus use).
 
   info "Checking core Steam dependencies..."
   for dep in "${core_deps[@]}"; do
@@ -727,15 +790,44 @@ check_steam_dependencies() {
           read -p "Install AUR packages with $aur_helper_available? [y/N]: " -n 1 -r
           echo
           if [[ $REPLY =~ ^[Yy]$ ]]; then
-            for dep in "${aur_optional[@]}"; do
-              info "Installing $dep..."
-              # Use --skipreview (paru) to avoid blocking on out-of-date prompts with --noconfirm
-              local aur_flags=(--needed --noconfirm)
-              if [[ "$aur_helper_available" == "paru" ]]; then
-                aur_flags+=(--skipreview)
+            # Pre-flight: confirm AUR is reachable. paru/yay don't retry
+            # transient `git clone` failures, and this block's per-pkg
+            # `|| warn` means a network blip silently skips the install —
+            # e.g. proton-ge-custom-bin missing despite "successful" run.
+            local aur_reachable=false
+            for probe in 1 2 3; do
+              if curl -sSf --max-time 10 -o /dev/null "https://aur.archlinux.org/" 2>/dev/null; then
+                aur_reachable=true
+                break
               fi
-              $aur_helper_available -S "${aur_flags[@]}" "$dep" || warn "Failed to install $dep from AUR"
+              warn "AUR not reachable (attempt $probe/3) — waiting 10s..."
+              sleep 10
             done
+            if ! $aur_reachable; then
+              err "Cannot reach https://aur.archlinux.org/ — skipping AUR recommended packages."
+              err "Install manually later: $aur_helper_available -S ${aur_optional[*]}"
+            else
+              for dep in "${aur_optional[@]}"; do
+                info "Installing $dep..."
+                # Use --skipreview (paru) to avoid blocking on out-of-date prompts with --noconfirm
+                local aur_flags=(--needed --noconfirm)
+                if [[ "$aur_helper_available" == "paru" ]]; then
+                  aur_flags+=(--skipreview)
+                fi
+                local dep_ok=false
+                for attempt in 1 2 3; do
+                  if $aur_helper_available -S "${aur_flags[@]}" "$dep"; then
+                    dep_ok=true
+                    break
+                  fi
+                  if [[ $attempt -lt 3 ]]; then
+                    warn "Install of $dep failed (attempt $attempt/3) — retrying in 15s..."
+                    sleep 15
+                  fi
+                done
+                $dep_ok || warn "Failed to install $dep from AUR after 3 attempts"
+              done
+            fi
           fi
         else
           info "No functional AUR helper found (yay/paru). Install manually if desired."
@@ -749,7 +841,139 @@ check_steam_dependencies() {
   echo ""
   echo "================================================================"
 
+  install_proton_ge_from_github
+
   check_steam_config
+}
+
+# Install latest GE-Proton release tarball straight from GloriousEggroll's
+# GitHub releases into the per-user compatibilitytools.d/. This is the same
+# thing the AUR pkg `proton-ge-custom-bin` does (and what protonup-qt does
+# under the hood), but without depending on AUR's git backend — which has
+# been flaky enough to silently skip Proton-GE on past installs.
+install_proton_ge_from_github() {
+  local target_user="${SUDO_USER:-$USER}"
+  local user_home
+  user_home=$(getent passwd "$target_user" | cut -d: -f6)
+  if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+    warn "Could not resolve home dir for $target_user — skipping Proton-GE install"
+    return 0
+  fi
+
+  local install_dir="$user_home/.steam/steam/compatibilitytools.d"
+
+  # Idempotent: if any GE-Proton* directory already exists (from AUR pkg,
+  # protonup-qt, or a previous run of this function), don't reinstall.
+  if compgen -G "$install_dir/GE-Proton*" > /dev/null 2>&1; then
+    local existing
+    existing=$(basename "$(compgen -G "$install_dir/GE-Proton*" | head -1)")
+    info "Proton-GE already installed: $existing — skipping"
+    return 0
+  fi
+
+  echo ""
+  echo "================================================================"
+  echo "  PROTON-GE INSTALL (direct from GitHub releases)"
+  echo "================================================================"
+  echo ""
+  echo "  Downloads the latest GE-Proton release (~700 MB) directly from"
+  echo "  github.com/GloriousEggroll/proton-ge-custom into:"
+  echo "    $install_dir"
+  echo ""
+  read -p "Install Proton-GE now? [Y/n]: " -n 1 -r
+  echo
+  if [[ $REPLY =~ ^[Nn]$ ]]; then
+    info "Skipping Proton-GE install"
+    return 0
+  fi
+
+  # Need curl and tar — both ship in base CachyOS, but guard anyway.
+  for cmd in curl tar sha512sum; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      err "Required command '$cmd' missing — cannot install Proton-GE from GitHub"
+      return 1
+    fi
+  done
+
+  info "Fetching latest GE-Proton release info from GitHub API..."
+  local api_url="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
+  local release_json
+  release_json=$(curl -sSfL --max-time 20 --retry 3 --retry-delay 5 "$api_url") || {
+    err "Failed to fetch release info from $api_url"
+    return 1
+  }
+
+  local tarball_url sha_url
+  tarball_url=$(echo "$release_json" | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+\.tar\.gz"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+  sha_url=$(echo "$release_json" | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+\.sha512sum"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+
+  if [[ -z "$tarball_url" ]]; then
+    err "Could not find .tar.gz asset URL in GitHub release JSON"
+    return 1
+  fi
+
+  local tarball_name sha_name
+  tarball_name=$(basename "$tarball_url")
+  sha_name=$(basename "$sha_url")
+  info "Latest release: ${tarball_name%.tar.gz}"
+
+  # Ensure target dir exists and is owned by the user
+  if [[ ! -d "$install_dir" ]]; then
+    sudo -u "$target_user" mkdir -p "$install_dir" || {
+      err "Failed to create $install_dir"
+      return 1
+    }
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d) || { err "mktemp failed"; return 1; }
+  # NOTE: do NOT use a RETURN trap here. The script has `set -u` and the
+  # RETURN trap fires on caller-function returns too (functrace semantics),
+  # at which point the local `tmpdir` is out of scope → "unbound variable"
+  # at the trap's `"$tmpdir"` expansion. Explicit cleanup at each exit
+  # path is safer.
+  _proton_ge_cleanup() { rm -rf "$tmpdir"; }
+
+  info "Downloading $tarball_name (this can take a few minutes)..."
+  if ! curl -fL --retry 3 --retry-delay 10 -C - --max-time 1800 \
+        -o "$tmpdir/$tarball_name" "$tarball_url"; then
+    err "Download failed: $tarball_url"
+    _proton_ge_cleanup
+    return 1
+  fi
+
+  if [[ -n "$sha_url" ]]; then
+    info "Downloading checksum..."
+    if curl -fsSL --retry 3 --max-time 30 -o "$tmpdir/$sha_name" "$sha_url"; then
+      info "Verifying SHA512..."
+      ( cd "$tmpdir" && sha512sum -c "$sha_name" --status ) || {
+        err "SHA512 verification failed — refusing to install"
+        _proton_ge_cleanup
+        return 1
+      }
+      info "Checksum OK"
+    else
+      warn "Could not download checksum file — proceeding without verification"
+    fi
+  fi
+
+  info "Extracting into $install_dir..."
+  if ! sudo -u "$target_user" tar -xzf "$tmpdir/$tarball_name" -C "$install_dir"; then
+    err "Extraction failed"
+    _proton_ge_cleanup
+    return 1
+  fi
+
+  _proton_ge_cleanup
+
+  local extracted="${tarball_name%.tar.gz}"
+  if [[ ! -d "$install_dir/$extracted" ]]; then
+    warn "Expected $install_dir/$extracted not found after extract — check manually"
+  else
+    info "Proton-GE installed: $install_dir/$extracted"
+  fi
+  info "Restart Steam fully (tray icon → Exit, then relaunch) to pick it up."
+  return 0
 }
 
 enable_multilib_repo() {
@@ -904,9 +1128,9 @@ UDEV_RULES
 
     if sudo tee "$sudoers_file" > /dev/null << 'SUDOERS_PERF'
 %video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w kernel.sched_autogroup_enabled=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w kernel.sched_migration_cost_ns=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w kernel.sched_min_granularity_ns=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w kernel.sched_latency_ns=*
+# kernel.sched_migration_cost_ns / sched_min_granularity_ns / sched_latency_ns
+# were CFS-specific knobs removed when EEVDF replaced CFS in Linux 6.6.
+# Removed here to avoid granting permissions to call non-existent sysctls.
 %video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w vm.swappiness=*
 %video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w vm.dirty_ratio=*
 %video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w vm.dirty_background_ratio=*
@@ -1083,6 +1307,48 @@ detect_kde_session_name() {
   echo "$session_name"
 }
 
+# Detect the active display/login manager. CachyOS switched the default from
+# SDDM to KDE's plasma-login-manager (binary: plasmalogin, service:
+# plasmalogin.service, config dir: /etc/plasmalogin.conf.d). The two share the
+# same INI grammar, so we just parameterize service name + config paths and
+# reuse the same logic for either.
+# Sets globals: DM_NAME, DM_SERVICE, DM_CONF, DM_CONF_DIR
+detect_display_manager() {
+  local dm_target=""
+  if [[ -L /etc/systemd/system/display-manager.service ]]; then
+    dm_target=$(basename "$(readlink /etc/systemd/system/display-manager.service)" .service)
+  fi
+  case "$dm_target" in
+    plasmalogin)
+      DM_NAME="plasma-login-manager"
+      DM_SERVICE="plasmalogin"
+      DM_CONF="/etc/plasmalogin.conf"
+      DM_CONF_DIR="/etc/plasmalogin.conf.d"
+      ;;
+    sddm)
+      DM_NAME="sddm"
+      DM_SERVICE="sddm"
+      DM_CONF="/etc/sddm.conf"
+      DM_CONF_DIR="/etc/sddm.conf.d"
+      ;;
+    *)
+      if systemctl list-unit-files plasmalogin.service &>/dev/null || command -v plasmalogin >/dev/null 2>&1; then
+        DM_NAME="plasma-login-manager"
+        DM_SERVICE="plasmalogin"
+        DM_CONF="/etc/plasmalogin.conf"
+        DM_CONF_DIR="/etc/plasmalogin.conf.d"
+      elif systemctl list-unit-files sddm.service &>/dev/null || command -v sddm >/dev/null 2>&1; then
+        DM_NAME="sddm"
+        DM_SERVICE="sddm"
+        DM_CONF="/etc/sddm.conf"
+        DM_CONF_DIR="/etc/sddm.conf.d"
+      else
+        die "No supported display manager found (need plasma-login-manager or sddm)"
+      fi
+      ;;
+  esac
+}
+
 setup_kde_shortcut() {
   local user_home="$1"
 
@@ -1166,6 +1432,9 @@ setup_session_switching() {
   echo "  Using ChimeraOS gamescope-session packages"
   echo "================================================================"
   echo ""
+
+  detect_display_manager
+  info "Display manager: ${DM_NAME} (service ${DM_SERVICE}, conf ${DM_CONF_DIR})"
 
   # Intel-only check
   if check_intel_only; then
@@ -1347,15 +1616,25 @@ setup_session_switching() {
   )
 
   local cleaned=false
+  local skipped=false
   for old_file in "${old_files[@]}"; do
-    if [[ -f "$old_file" ]]; then
-      info "Removing old file: $old_file"
-      sudo rm -f "$old_file" && cleaned=true
+    [[ -f "$old_file" ]] || continue
+    # Don't delete files owned by an installed package — the steamos-* helpers
+    # are now shipped by gamescope-session-steam-git (the AUR package this
+    # script later installs). Blind deletion forces an unnecessary AUR rebuild
+    # on every run and briefly leaves the system with missing binaries.
+    if pacman -Qo "$old_file" &>/dev/null; then
+      skipped=true
+      continue
     fi
+    info "Removing old file: $old_file"
+    sudo rm -f "$old_file" && cleaned=true
   done
 
   if $cleaned; then
     info "Old custom session files removed"
+  elif $skipped; then
+    info "No orphan files to clean up (package-owned files left intact)"
   else
     info "No old files to clean up"
   fi
@@ -1365,14 +1644,41 @@ setup_session_switching() {
   local -a aur_packages=()
   local -a packages_to_remove=()
 
-  if ! check_package "gamescope-session-git" && ! check_package "gamescope-session"; then
+  # Use literal-package detection, NOT provides-aware detection.
+  # `check_package` (pacman -Qi) returns true for "gamescope-session-steam-git"
+  # whenever gamescope-session-cachyos is installed (it declares
+  # Provides=gamescope-session-steam-git), which previously caused this block
+  # to (a) think the AUR package was already in place and (b) queue the wrong
+  # name for removal — leading to `pacman -Rdd gamescope-session-steam-git`
+  # failing with "target not found" while the real conflicting package
+  # (cachyos) stayed installed and blocked the AUR build.
+  literal_installed() { pacman -Qq 2>/dev/null | grep -qx "$1"; }
+
+  # If the CachyOS provider is installed, treat both -git names as not-installed
+  # and queue the provider for removal up front. -git packages ship files
+  # (notably /usr/share/gamescope-session-plus/gamescope-session-plus) that the
+  # autologin wrapper depends on; the cachyos provider does not.
+  #
+  # Also queue jupiter-hw-support: it's pulled in as a hard dep of
+  # gamescope-session-cachyos and owns /usr/bin/jupiter-biosupdate +
+  # /usr/bin/steamos-polkit-helpers/* — the same paths the AUR
+  # gamescope-session-steam-git installs. Leaving it in place produces
+  # "exists in filesystem (owned by jupiter-hw-support)" file conflicts during
+  # the AUR install. gamescope-session-steam-git ships its own replacements
+  # for everything jupiter-hw-support provides, so removing it is safe.
+  local cachyos_provider=false
+  if literal_installed "gamescope-session-cachyos"; then
+    cachyos_provider=true
+    packages_to_remove+=("gamescope-session-cachyos")
+    info "Detected gamescope-session-cachyos — will remove so AUR build can run"
+  fi
+  if literal_installed "jupiter-hw-support"; then
+    packages_to_remove+=("jupiter-hw-support")
+    info "Will also remove jupiter-hw-support (replaced by gamescope-session-steam-git)"
+  fi
+
+  if $cachyos_provider || (! literal_installed "gamescope-session-git" && ! literal_installed "gamescope-session"); then
     aur_packages+=("gamescope-session-git")
-    # Remove conflicting providers (e.g. gamescope-session-cachyos)
-    for conflicting in gamescope-session-cachyos; do
-      if check_package "$conflicting"; then
-        packages_to_remove+=("$conflicting")
-      fi
-    done
   fi
 
   local steam_scripts_missing=false
@@ -1390,8 +1696,8 @@ setup_session_switching() {
     fi
   done
 
-  if ! check_package "gamescope-session-steam-git"; then
-    if check_package "gamescope-session-steam"; then
+  if $cachyos_provider || ! literal_installed "gamescope-session-steam-git"; then
+    if literal_installed "gamescope-session-steam"; then
       warn "gamescope-session-steam (non-git) is installed but missing Steam compatibility scripts"
       info "The -git version from ChimeraOS includes required scripts:"
       info "  - steamos-session-select, steamos-update, jupiter-biosupdate, steamos-select-branch"
@@ -1462,17 +1768,75 @@ setup_session_switching() {
         fi
 
         info "Installing ChimeraOS gamescope-session packages..."
-        local overwrite_flags="--overwrite '/usr/bin/steamos-polkit-helpers/*'"
-        if [[ "$aur_helper" == "yay" ]]; then
-          $aur_helper -S --needed --noconfirm --answeredit None --answerclean None --answerdiff None $overwrite_flags "${aur_packages[@]}" || {
-            err "Failed to install gamescope-session packages"
-            warn "You may need to install them manually: $aur_helper -S ${aur_packages[*]}"
-          }
-        else
-          $aur_helper -S --needed --noconfirm --skipreview $overwrite_flags "${aur_packages[@]}" || {
-            err "Failed to install gamescope-session packages"
-            warn "You may need to install them manually: $aur_helper -S ${aur_packages[*]}"
-          }
+        # Force AUR origin with `aur/` prefix. Without it, paru/yay will resolve
+        # these names to gamescope-session-cachyos (a CachyOS-repo package that
+        # declares Provides=gamescope-session-git,gamescope-session-steam-git)
+        # and silently install that instead — which does NOT ship
+        # /usr/share/gamescope-session-plus/gamescope-session-plus, so the
+        # session wrapper exits immediately and plasmalogin autologin loops.
+        local -a aur_qualified=()
+        for pkg in "${aur_packages[@]}"; do
+          aur_qualified+=("aur/${pkg}")
+        done
+        # --overwrite belt-and-suspenders for any stale file from a partial
+        # prior run that wasn't removed by the packages_to_remove step above.
+        local overwrite_flags="--overwrite '/usr/bin/steamos-polkit-helpers/*' --overwrite '/usr/bin/jupiter-biosupdate' --overwrite '/usr/bin/steamos-update' --overwrite '/usr/bin/steamos-select-branch' --overwrite '/usr/bin/steamos-session-select'"
+
+        # Pre-flight: confirm AUR is reachable before paru/yay tries to clone.
+        # paru reports the underlying git failure ("Empty reply from server")
+        # without retrying, so a transient AUR outage kills the whole install.
+        # Probe explicitly so we can fail fast with a clear message OR retry.
+        local aur_reachable=false
+        for probe in 1 2 3; do
+          if curl -sSf --max-time 10 -o /dev/null "https://aur.archlinux.org/" 2>/dev/null; then
+            aur_reachable=true
+            break
+          fi
+          warn "AUR not reachable (attempt $probe/3) — waiting 10s..."
+          sleep 10
+        done
+        if ! $aur_reachable; then
+          err "Cannot reach https://aur.archlinux.org/ after 3 attempts."
+          err "AUR may be having an outage, or your network/DNS/firewall is blocking it."
+          err "Try again later: $aur_helper -S ${aur_qualified[*]}"
+          die "Aborting — AUR build cannot proceed without aur.archlinux.org"
+        fi
+
+        # Retry the AUR install itself in case the clone fails mid-build
+        # (paru/yay don't retry transient git clone failures internally).
+        local install_ok=false
+        for attempt in 1 2 3; do
+          if [[ "$aur_helper" == "yay" ]]; then
+            if $aur_helper -S --needed --noconfirm --answeredit None --answerclean None --answerdiff None $overwrite_flags "${aur_qualified[@]}"; then
+              install_ok=true
+              break
+            fi
+          else
+            if $aur_helper -S --needed --noconfirm --skipreview $overwrite_flags "${aur_qualified[@]}"; then
+              install_ok=true
+              break
+            fi
+          fi
+          if [[ $attempt -lt 3 ]]; then
+            warn "AUR install attempt $attempt/3 failed — retrying in 15s..."
+            sleep 15
+          fi
+        done
+        if ! $install_ok; then
+          err "Failed to install gamescope-session packages after 3 attempts"
+          warn "You may need to install them manually: $aur_helper -S ${aur_qualified[*]}"
+        fi
+
+        # Verify the AUR build actually landed — if pacman silently picked
+        # the cachyos provider, /usr/share/gamescope-session-plus/gamescope-session-plus
+        # will be missing and the gaming session will black-screen on autologin.
+        if [[ ! -x /usr/share/gamescope-session-plus/gamescope-session-plus ]]; then
+          err "AUR build appears to have been skipped — gamescope-session-plus is missing."
+          if pacman -Qi gamescope-session-cachyos &>/dev/null; then
+            err "gamescope-session-cachyos is installed and shadowed the AUR build."
+            err "Run: sudo pacman -Rdd gamescope-session-cachyos && $aur_helper -S aur/gamescope-session-git aur/gamescope-session-steam-git"
+          fi
+          die "Cannot continue — session launcher /usr/share/gamescope-session-plus/gamescope-session-plus not found"
         fi
       fi
     else
@@ -1488,9 +1852,12 @@ setup_session_switching() {
     info "ChimeraOS gamescope-session packages already installed (correct -git versions)"
   fi
 
-  # Prevent distro repos (e.g. CachyOS) from replacing -git packages on system upgrades
+  # Prevent distro repos (e.g. CachyOS) from replacing -git packages on system upgrades.
+  # gamescope-session-cachyos is added here too: it declares Provides+Conflicts on
+  # the -git names, so a plain `pacman -Syu` would otherwise offer to swap our
+  # AUR build out for the repo version on every system update.
   info "Ensuring gamescope-session -git packages are protected from replacement..."
-  local ignore_pkgs=("gamescope-session-git" "gamescope-session-steam-git")
+  local ignore_pkgs=("gamescope-session-git" "gamescope-session-steam-git" "gamescope-session-cachyos")
   local pacman_conf="/etc/pacman.conf"
   for pkg in "${ignore_pkgs[@]}"; do
     if grep -q "^IgnorePkg" "$pacman_conf"; then
@@ -2001,7 +2368,7 @@ NM_WRAPPER
   sudo chmod +x "$nm_wrapper"
   info "Created $nm_wrapper"
 
-  info "Creating SDDM session entry..."
+  info "Creating Wayland session entry..."
   local session_desktop="/usr/share/wayland-sessions/gamescope-session-steam-nm.desktop"
 
   sudo tee "$session_desktop" > /dev/null << 'SESSION_DESKTOP'
@@ -2018,7 +2385,7 @@ SESSION_DESKTOP
   info "Creating session-select script..."
   local os_session_select="/usr/lib/os-session-select"
 
-  sudo tee "$os_session_select" > /dev/null << 'OS_SESSION_SELECT'
+  sudo tee "$os_session_select" > /dev/null << OS_SESSION_SELECT
 #!/bin/bash
 rm -f /tmp/.gaming-session-active
 sudo -n /usr/local/bin/gaming-session-switch desktop 2>/dev/null || {
@@ -2026,7 +2393,7 @@ sudo -n /usr/local/bin/gaming-session-switch desktop 2>/dev/null || {
 }
 timeout 5 steam -shutdown 2>/dev/null || true
 sleep 1
-nohup sudo -n systemctl restart sddm &>/dev/null &
+nohup sudo -n systemctl restart ${DM_SERVICE} &>/dev/null &
 disown
 exit 0
 OS_SESSION_SELECT
@@ -2037,7 +2404,7 @@ OS_SESSION_SELECT
   info "Creating switch-to-gaming script..."
   local switch_script="/usr/local/bin/switch-to-gaming"
 
-  sudo tee "$switch_script" > /dev/null << 'SWITCH_SCRIPT'
+  sudo tee "$switch_script" > /dev/null << SWITCH_SCRIPT
 #!/bin/bash
 # Inhibit suspend FIRST
 sudo -n systemctl mask --runtime sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null
@@ -2050,7 +2417,7 @@ pkill -9 -f gamescope-session 2>/dev/null || true
 sleep 1
 sudo -n chvt 2 2>/dev/null || true
 sleep 0.3
-sudo -n systemctl restart sddm
+sudo -n systemctl restart ${DM_SERVICE}
 SWITCH_SCRIPT
 
   sudo chmod +x "$switch_script"
@@ -2059,7 +2426,7 @@ SWITCH_SCRIPT
   info "Creating switch-to-desktop script..."
   local switch_desktop_script="/usr/local/bin/switch-to-desktop"
 
-  sudo tee "$switch_desktop_script" > /dev/null << 'SWITCH_DESKTOP'
+  sudo tee "$switch_desktop_script" > /dev/null << SWITCH_DESKTOP
 #!/bin/bash
 if [[ ! -f /tmp/.gaming-session-active ]]; then
   exit 0
@@ -2093,9 +2460,9 @@ sleep 2
 
 sudo -n chvt 2 2>/dev/null || true
 sleep 0.5
-sudo -n systemctl stop sddm 2>/dev/null || true
+sudo -n systemctl stop ${DM_SERVICE} 2>/dev/null || true
 sleep 1
-sudo -n systemctl start sddm &
+sudo -n systemctl start ${DM_SERVICE} &
 disown
 exit 0
 SWITCH_DESKTOP
@@ -2200,44 +2567,62 @@ KEYBIND_MONITOR
   kde_session_name=$(detect_kde_session_name)
   info "Detected KDE session: $kde_session_name"
 
-  info "Creating SDDM session switching config..."
-  local sddm_gaming_conf="/etc/sddm.conf.d/zz-gaming-session.conf"
+  info "Creating ${DM_NAME} session switching config..."
+  local dm_gaming_conf="${DM_CONF_DIR}/zzz-gaming-session.conf"
 
   local autologin_user="$current_user"
-  if [[ -f /etc/sddm.conf.d/autologin.conf ]]; then
-    autologin_user=$(sed -n 's/^User=//p' /etc/sddm.conf.d/autologin.conf 2>/dev/null | head -1)
+  if [[ -f "${DM_CONF_DIR}/autologin.conf" ]]; then
+    autologin_user=$(sed -n 's/^User=//p' "${DM_CONF_DIR}/autologin.conf" 2>/dev/null | head -1)
     [[ -z "$autologin_user" ]] && autologin_user="$current_user"
   fi
 
-  sudo mkdir -p /etc/sddm.conf.d
-  sudo tee "$sddm_gaming_conf" > /dev/null << SDDM_GAMING
+  sudo mkdir -p "${DM_CONF_DIR}"
+
+  # Clean up any drop-in from older script versions (zz-* sorts BEFORE
+  # CachyOS's own zz-steamos-autologin.conf, so it would be overridden and
+  # the Session= toggle would silently no-op). We now use a zzz- prefix to
+  # guarantee precedence over any zz-* file shipped by the distro.
+  local stale_drop_in="${DM_CONF_DIR}/zz-gaming-session.conf"
+  if [[ -f "$stale_drop_in" ]]; then
+    info "Removing stale $stale_drop_in (replaced by zzz- prefixed version)"
+    sudo rm -f "$stale_drop_in"
+  fi
+
+  sudo tee "$dm_gaming_conf" > /dev/null << DM_GAMING
 [Autologin]
 User=${autologin_user}
 Session=${kde_session_name}
 Relogin=true
-SDDM_GAMING
+DM_GAMING
 
-  info "Created $sddm_gaming_conf (default session: $kde_session_name)"
+  info "Created $dm_gaming_conf (default session: $kde_session_name)"
 
-  # Remove conflicting Session=/Autologin from /etc/sddm.conf so .conf.d takes effect
-  if [[ -f /etc/sddm.conf ]] && grep -q '^Session=' /etc/sddm.conf 2>/dev/null; then
-    info "Removing conflicting Session= from /etc/sddm.conf (would override .conf.d)..."
-    sudo sed -i '/^Session=.*/d' /etc/sddm.conf
+  # Remove conflicting Session= from the main conf so .conf.d takes effect
+  if [[ -f "${DM_CONF}" ]] && grep -q '^Session=' "${DM_CONF}" 2>/dev/null; then
+    info "Removing conflicting Session= from ${DM_CONF} (would override .conf.d)..."
+    sudo sed -i '/^Session=.*/d' "${DM_CONF}"
     # Clean up empty [Autologin] section if nothing left in it
-    if ! grep -qE '^(User|Session|Relogin)=' /etc/sddm.conf 2>/dev/null; then
-      sudo sed -i '/^\[Autologin\]/d' /etc/sddm.conf
+    if ! grep -qE '^(User|Session|Relogin)=' "${DM_CONF}" 2>/dev/null; then
+      sudo sed -i '/^\[Autologin\]/d' "${DM_CONF}"
     fi
-    sudo sed -i '/^[[:space:]]*$/d' /etc/sddm.conf
+    sudo sed -i '/^[[:space:]]*$/d' "${DM_CONF}"
   fi
 
-  # Ensure user is in the autologin group (required by SDDM for passwordless login)
-  if ! groups "$autologin_user" 2>/dev/null | grep -q '\bautologin\b'; then
-    info "Adding $autologin_user to autologin group for passwordless session switching..."
-    sudo groupadd -f autologin
-    sudo usermod -aG autologin "$autologin_user"
-    info "Added $autologin_user to autologin group"
+  # SDDM's autologin PAM rule requires the user to be in an `autologin` Unix
+  # group (pam_succeed_if user ingroup autologin). plasma-login-manager's PAM
+  # file uses pam_permit.so instead, so the group isn't checked — but adding
+  # the user to it is harmless and keeps the script portable across DMs.
+  if [[ "$DM_SERVICE" == "sddm" ]]; then
+    if ! groups "$autologin_user" 2>/dev/null | grep -q '\bautologin\b'; then
+      info "Adding $autologin_user to autologin group for passwordless session switching (SDDM)..."
+      sudo groupadd -f autologin
+      sudo usermod -aG autologin "$autologin_user"
+      info "Added $autologin_user to autologin group"
+    else
+      info "User $autologin_user already in autologin group"
+    fi
   else
-    info "User $autologin_user already in autologin group"
+    info "Skipping autologin group setup — not required by ${DM_NAME}"
   fi
 
   info "Creating session switching helper script..."
@@ -2245,8 +2630,8 @@ SDDM_GAMING
 
   sudo tee "$session_helper" > /dev/null << SESSION_HELPER
 #!/bin/bash
-CONF="/etc/sddm.conf.d/zz-gaming-session.conf"
-MAIN_CONF="/etc/sddm.conf"
+CONF="${DM_CONF_DIR}/zzz-gaming-session.conf"
+MAIN_CONF="${DM_CONF}"
 
 if [[ ! -f "\$CONF" ]]; then
   echo "Error: Config file not found: \$CONF" >&2
@@ -2268,7 +2653,7 @@ case "\$1" in
     ;;
 esac
 
-# Remove conflicting Session= from /etc/sddm.conf so .conf.d takes effect
+# Remove conflicting Session= from main conf so .conf.d takes effect
 if [[ -f "\$MAIN_CONF" ]] && grep -q '^Session=' "\$MAIN_CONF" 2>/dev/null; then
   sed -i '/^Session=.*/d' "\$MAIN_CONF"
   # Clean up empty [Autologin] section if nothing left in it
@@ -2292,11 +2677,11 @@ SESSION_HELPER
   info "Creating sudoers rules for session switching..."
   sudo mkdir -p /etc/sudoers.d
 
-  if sudo tee "$sudoers_session" > /dev/null << 'SUDOERS_SWITCH'
+  if sudo tee "$sudoers_session" > /dev/null << SUDOERS_SWITCH
 %video ALL=(ALL) NOPASSWD: /usr/local/bin/gaming-session-switch
-%video ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart sddm
-%video ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop sddm
-%video ALL=(ALL) NOPASSWD: /usr/bin/systemctl start sddm
+%video ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart ${DM_SERVICE}
+%video ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop ${DM_SERVICE}
+%video ALL=(ALL) NOPASSWD: /usr/bin/systemctl start ${DM_SERVICE}
 %video ALL=(ALL) NOPASSWD: /usr/bin/chvt
 %video ALL=(ALL) NOPASSWD: /usr/bin/systemctl mask --runtime sleep.target suspend.target hibernate.target hybrid-sleep.target
 %video ALL=(ALL) NOPASSWD: /usr/bin/systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target
@@ -2424,6 +2809,9 @@ verify_installation() {
   echo "================================================================"
   echo ""
 
+  detect_display_manager
+  info "Display manager: ${DM_NAME}"
+
   local all_ok=true
   local missing_files=()
   local permission_issues=()
@@ -2443,10 +2831,10 @@ verify_installation() {
     ["/usr/bin/steamos-update"]="755:Steam compatibility (from AUR package)"
     ["/usr/bin/jupiter-biosupdate"]="755:Steam compatibility (from AUR package)"
     ["/usr/bin/steamos-select-branch"]="755:Steam compatibility (from AUR package)"
-    ["/usr/share/wayland-sessions/gamescope-session-steam-nm.desktop"]="644:SDDM session entry"
+    ["/usr/share/wayland-sessions/gamescope-session-steam-nm.desktop"]="644:Wayland session entry"
     ["/usr/share/gamescope-session-plus/gamescope-session-plus"]="755:ChimeraOS session launcher (from AUR)"
     ["/usr/share/applications/switch-to-gaming.desktop"]="644:KDE shortcut desktop entry"
-    ["/etc/sddm.conf.d/zz-gaming-session.conf"]="644:SDDM session switching config"
+    ["${DM_CONF_DIR}/zzz-gaming-session.conf"]="644:${DM_NAME} session switching config"
     ["/etc/polkit-1/rules.d/50-gamescope-networkmanager.rules"]="644:Polkit NM rules"
     ["/etc/polkit-1/rules.d/50-udisks-gaming.rules"]="644:Polkit udisks2 rules (external drive mount)"
     ["/etc/sudoers.d/gaming-session-switch"]="440:Sudoers rules"

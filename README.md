@@ -10,13 +10,26 @@ Switch between KDE Plasma desktop and Steam Big Picture Gaming Mode with a keybo
 
 **Super+Alt+S** to enter Gaming Mode. **Super+Alt+R** to return to desktop.
 
+## What's new (2026-05-16)
+
+A round of CachyOS-compatibility and reliability work. No new shortcuts or user-visible flow changes, but several quiet footguns from the initial release are fixed.
+
+- **plasma-login-manager support.** CachyOS now ships `plasmalogin` by default instead of SDDM. The installer detects which DM is active and parameterises every session-switch script, sudoers entry, and config path accordingly. SDDM hosts behave exactly as before.
+- **Proton-GE installed direct from GitHub** instead of via the AUR's `proton-ge-custom-bin`, which had been silently failing. The new path is idempotent (skips if a `GE-Proton*` directory already exists) and SHA-verified.
+- **AUR resilience.** Both the gamescope-session install and the optional-AUR-deps phase now check AUR reachability up front and retry the install up to 3× with 15s backoff. Stops the old "silent skip" mode where a transient AUR outage left the gaming session uninstalled.
+- **Fixed: CachyOS package conflicts.** `gamescope-session-cachyos` (which `Provides=` the -git names but is missing files gamescope-session-plus needs) is now removed pre-emptively, then locked in `IgnorePkg` so `pacman -Syu` won't try to swap it back. Resolves the autologin black-screen loop a few users hit.
+- **Fixed: SDDM drop-in priority.** Renamed `/etc/sddm.conf.d/zz-gaming-session.conf` → `zzz-gaming-session.conf` so it outranks CachyOS's own `zz-steamos-autologin.conf` (lexical sort). The old file is auto-removed during install.
+- **Fixed: Limine on CachyOS.** When `/etc/default/limine` + `limine-update` are present, kernel-param edits go there (the source of truth) rather than to `/boot/limine.conf`, which gets regenerated on every mkinitcpio run.
+- **Post-install verification** now hard-fails with a clear remediation message if `gamescope-session-plus` is missing after the AUR build, instead of letting you reboot into a broken session.
+- **Removed CFS sysctls** from the sudoers entries (`sched_migration_cost_ns`, `sched_min_granularity_ns`, `sched_latency_ns`) — these knobs were deleted from the kernel when EEVDF replaced CFS in 6.6, so the sudoers lines just produced errors.
+
 ## What it does
 
 This installer sets up a full console-like gaming experience on your KDE Plasma desktop by configuring:
 
 - **Gamescope session** using ChimeraOS packages (`gamescope-session-git`, `gamescope-session-steam-git`)
 - **Steam Big Picture** running in a dedicated Wayland session via gamescope
-- **One-key switching** between KDE Plasma and Gaming Mode via SDDM session management
+- **One-key switching** between KDE Plasma and Gaming Mode — works with **SDDM** or **plasma-login-manager** (auto-detected)
 - **GPU auto-detection** for NVIDIA, AMD dGPU, and AMD APU systems
 - **Performance mode** with CPU governor, GPU power management, and kernel tuning
 - **NetworkManager integration** so Steam has network access even if your desktop uses iwd/systemd-networkd
@@ -28,7 +41,7 @@ This installer sets up a full console-like gaming experience on your KDE Plasma 
 
 - **Arch Linux** or **CachyOS** (or any Arch-based distro with KDE Plasma)
 - **KDE Plasma 6** (Wayland)
-- **SDDM** display manager
+- **SDDM** or **plasma-login-manager** display manager (CachyOS ships `plasmalogin` by default — the installer auto-detects either)
 - **AMD or NVIDIA GPU** (Intel-only is not supported)
 - **Steam** (installed during setup if missing)
 - **AUR helper** (yay or paru) for ChimeraOS session packages
@@ -58,8 +71,9 @@ The installer is interactive and will walk you through each step, asking before 
 
 - Steam and all required 32-bit libraries
 - GPU-specific Vulkan drivers (NVIDIA or AMD)
-- gamescope, mangohud, gamemode, proton-ge-custom-bin
-- gamescope-session-git + gamescope-session-steam-git (ChimeraOS AUR packages)
+- gamescope, mangohud, gamemode
+- **Proton-GE** — latest release pulled direct from GitHub into `~/.steam/steam/compatibilitytools.d/` (the AUR `proton-ge-custom-bin` is unreliable, so we skip it)
+- gamescope-session-git + gamescope-session-steam-git (ChimeraOS AUR packages, with retry-on-failure + AUR reachability checks)
 - python-evdev (for keybind monitoring)
 
 ### Scripts
@@ -80,7 +94,7 @@ The installer is interactive and will walk you through each step, asking before 
 
 | File | Purpose |
 |---|---|
-| `/etc/sddm.conf.d/zz-gaming-session.conf` | SDDM autologin session switching |
+| `/etc/sddm.conf.d/zzz-gaming-session.conf` (or `/etc/plasma-login-manager.conf.d/`) | DM autologin session switching — `zzz-*` prefix outranks CachyOS's own `zz-steamos-autologin.conf` |
 | `/etc/sudoers.d/gaming-session-switch` | Passwordless sudo for session switching |
 | `/etc/sudoers.d/gaming-mode-sysctl` | Passwordless sudo for performance tuning |
 | `/etc/udev/rules.d/99-gaming-performance.rules` | CPU/GPU sysfs permissions |
@@ -137,11 +151,11 @@ This checks all files, permissions, packages, user groups, and service status.
 
 ## How it works
 
-1. **KDE to Gaming Mode (Super+Alt+S):** The `switch-to-gaming` script updates SDDM's session config to `gamescope-session-steam-nm`, kills any existing gamescope, and restarts SDDM. SDDM auto-logs in to the gaming session.
+1. **KDE to Gaming Mode (Super+Alt+S):** The `switch-to-gaming` script updates the display manager's session config to `gamescope-session-steam-nm`, kills any existing gamescope, and restarts the DM service. The DM auto-logs in to the gaming session. (SDDM and plasma-login-manager are both supported — the installer detects which one you're running and parameterises the scripts accordingly.)
 
 2. **Gaming session startup:** The `gamescope-session-nm-wrapper` enables performance mode (CPU governor, GPU power), starts NetworkManager, launches the Steam library drive monitor, starts the keybind monitor, then hands off to ChimeraOS's `gamescope-session-plus` which launches gamescope with Steam.
 
-3. **Gaming Mode to KDE (Super+Alt+R):** The `gaming-keybind-monitor` Python daemon detects the key combo via evdev and calls `switch-to-desktop`, which shuts down Steam, kills gamescope, updates SDDM config back to KDE Plasma, and restarts SDDM.
+3. **Gaming Mode to KDE (Super+Alt+R):** The `gaming-keybind-monitor` Python daemon detects the key combo via evdev and calls `switch-to-desktop`, which shuts down Steam, kills gamescope, updates the DM config back to KDE Plasma, and restarts the DM service.
 
 4. **Cleanup on exit:** Performance mode is restored to balanced, NetworkManager is stopped (iwd restarted if needed), drive monitor and keybind monitor are killed.
 
@@ -165,6 +179,15 @@ This checks all files, permissions, packages, user groups, and service status.
 - Verify kernel parameter: `cat /proc/cmdline | grep nvidia-drm.modeset`
 - Reboot if you just added the parameter
 - Check DRM cards: `ls /sys/class/drm/card*/device/driver -la`
+
+### Proton-GE not appearing in Steam
+- Check it installed: `ls ~/.steam/steam/compatibilitytools.d/`
+- Restart Steam fully (not just the window — quit from the tray) so it picks up new compat tools
+- Re-run the installer to retry the GitHub download if the directory is empty
+
+### Black screen / login loop after entering Gaming Mode (CachyOS)
+- Usually means `gamescope-session-cachyos` was reinstalled by a system update. Re-run `./super-alt-s.sh` to remove it and lock it in `IgnorePkg`.
+- Confirm the AUR build succeeded: `ls /usr/share/gamescope-session-plus/gamescope-session-plus`
 
 ## License
 
