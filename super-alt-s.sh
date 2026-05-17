@@ -1,7 +1,7 @@
 #!/bin/bash
 set -Euo pipefail
 
-Super_Shift_S_VERSION="12.27-KDE"
+Super_Shift_S_VERSION="13.0-KDE"
 
 CONFIG_FILE="/etc/gaming-mode.conf"
 [[ -f "$HOME/.gaming-mode.conf" ]] && CONFIG_FILE="$HOME/.gaming-mode.conf"
@@ -860,16 +860,24 @@ install_proton_ge_from_github() {
     return 0
   fi
 
-  local install_dir="$user_home/.steam/steam/compatibilitytools.d"
+  # Write to the real Steam data dir, NOT ~/.steam/steam. The latter is a
+  # symlink that Steam itself creates on first launch (→ ~/.local/share/Steam).
+  # If we mkdir -p ~/.steam/steam before Steam has ever run, it becomes a real
+  # directory and Steam refuses to start with "can't configure Steam data".
+  local install_dir="$user_home/.local/share/Steam/compatibilitytools.d"
+  local legacy_dir="$user_home/.steam/steam/compatibilitytools.d"
 
   # Idempotent: if any GE-Proton* directory already exists (from AUR pkg,
   # protonup-qt, or a previous run of this function), don't reinstall.
-  if compgen -G "$install_dir/GE-Proton*" > /dev/null 2>&1; then
-    local existing
-    existing=$(basename "$(compgen -G "$install_dir/GE-Proton*" | head -1)")
-    info "Proton-GE already installed: $existing — skipping"
-    return 0
-  fi
+  # Check both the real path and the legacy symlink path.
+  for check_dir in "$install_dir" "$legacy_dir"; do
+    if compgen -G "$check_dir/GE-Proton*" > /dev/null 2>&1; then
+      local existing
+      existing=$(basename "$(compgen -G "$check_dir/GE-Proton*" | head -1)")
+      info "Proton-GE already installed: $existing — skipping"
+      return 0
+    fi
+  done
 
   echo ""
   echo "================================================================"
