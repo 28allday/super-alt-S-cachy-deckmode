@@ -1,7 +1,7 @@
 #!/bin/bash
 set -Euo pipefail
 
-Super_Shift_S_VERSION="13.0-KDE"
+Super_Shift_S_VERSION="13.1-KDE"
 
 CONFIG_FILE="/etc/gaming-mode.conf"
 [[ -f "$HOME/.gaming-mode.conf" ]] && CONFIG_FILE="$HOME/.gaming-mode.conf"
@@ -846,6 +846,95 @@ check_steam_dependencies() {
   check_steam_config
 }
 
+# Detect + repair a broken ~/.steam/steam state caused by older versions of
+# this script (≤12.27-KDE). Those versions mkdir -p'd ~/.steam/steam/... before
+# Steam had ever launched, forcing ~/.steam/steam to be a real directory.
+# Steam then refuses to start on first launch ("can't configure Steam data"
+# / "Steam needs to be online to update") because it can't create the
+# expected symlink ~/.steam/steam → ~/.local/share/Steam.
+#
+# Safe by design: only triggers when ~/.steam/steam is a real dir AND
+# contains none of the markers Steam itself drops on launch. Real Steam
+# state is left strictly alone.
+repair_broken_steam_data_dir() {
+  local target_user="$1"
+  local user_home="$2"
+  local steam_link="$user_home/.steam/steam"
+
+  # Already a symlink (good) or doesn't exist (fine) → nothing to repair.
+  [[ -L "$steam_link" ]] && return 0
+  [[ -e "$steam_link" ]] || return 0
+
+  # Real directory exists. If it contains any actual Steam-launched state,
+  # leave it alone — we will not touch real user data.
+  local marker has_real_data=false
+  for marker in steamapps SteamApps config userdata package registry.vdf clientregistry.blob steamui ubuntu12_32 ubuntu12_64; do
+    if [[ -e "$steam_link/$marker" ]]; then
+      has_real_data=true
+      break
+    fi
+  done
+
+  if $has_real_data; then
+    warn "$steam_link is a real directory containing Steam data."
+    warn "Not touching it. If Steam still fails to launch, you may need to"
+    warn "back it up and let Steam recreate the symlink manually."
+    return 0
+  fi
+
+  echo ""
+  echo "================================================================"
+  echo "  REPAIRING BROKEN STEAM DATA DIRECTORY"
+  echo "================================================================"
+  echo ""
+  echo "  Detected a broken state at:"
+  echo "    $steam_link"
+  echo ""
+  echo "  This is a real directory but contains no Steam state — symptom"
+  echo "  of an earlier version of this script (≤12.27-KDE). It causes"
+  echo "  desktop Steam to fail with 'can't configure Steam data'."
+  echo ""
+  echo "  Repair will:"
+  echo "    1. Move any GE-Proton* installs found inside it to the"
+  echo "       correct location (~/.local/share/Steam/compatibilitytools.d/)"
+  echo "    2. Remove $user_home/.steam so Steam can recreate it"
+  echo "       correctly as a symlink on next launch"
+  echo ""
+  read -p "Apply repair? [Y/n]: " -n 1 -r
+  echo
+  if [[ $REPLY =~ ^[Nn]$ ]]; then
+    warn "Skipping repair — desktop Steam will continue to fail"
+    return 0
+  fi
+
+  local real_compat="$user_home/.local/share/Steam/compatibilitytools.d"
+  local broken_compat="$steam_link/compatibilitytools.d"
+
+  if compgen -G "$broken_compat/GE-Proton*" > /dev/null 2>&1; then
+    info "Salvaging Proton-GE installs..."
+    sudo -u "$target_user" mkdir -p "$real_compat" || {
+      err "Could not create $real_compat — aborting repair"
+      return 1
+    }
+    local ge
+    for ge in "$broken_compat"/GE-Proton*; do
+      [[ -e "$ge" ]] || continue
+      info "  moving $(basename "$ge") → $real_compat/"
+      sudo -u "$target_user" mv "$ge" "$real_compat/" \
+        || warn "  failed to move $(basename "$ge") — leaving in place"
+    done
+  fi
+
+  info "Removing broken $user_home/.steam ..."
+  if sudo -u "$target_user" rm -rf "$user_home/.steam"; then
+    info "Repair complete. ~/.steam/steam will be recreated as a symlink"
+    info "the next time desktop Steam is launched."
+  else
+    err "Failed to remove $user_home/.steam — please remove it manually"
+    return 1
+  fi
+}
+
 # Install latest GE-Proton release tarball straight from GloriousEggroll's
 # GitHub releases into the per-user compatibilitytools.d/. This is the same
 # thing the AUR pkg `proton-ge-custom-bin` does (and what protonup-qt does
@@ -859,6 +948,10 @@ install_proton_ge_from_github() {
     warn "Could not resolve home dir for $target_user — skipping Proton-GE install"
     return 0
   fi
+
+  # MUST run before any idempotency check or mkdir — fixes broken state from
+  # older script versions so Steam can launch cleanly. No-op for fresh installs.
+  repair_broken_steam_data_dir "$target_user" "$user_home" || true
 
   # Write to the real Steam data dir, NOT ~/.steam/steam. The latter is a
   # symlink that Steam itself creates on first launch (→ ~/.local/share/Steam).
