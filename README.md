@@ -65,6 +65,33 @@ The installer is interactive and will walk you through each step, asking before 
 | Return to Desktop | **Super+Alt+R** (from Gaming Mode) |
 | Return to Desktop (fallback) | Steam > Power > Exit to Desktop |
 
+## Uninstall
+
+**Return to the desktop first** (Super+Alt+R) — the uninstaller refuses to run from inside Gaming Mode, because it deletes the scripts the session needs to switch back.
+
+From the cloned repo:
+
+```bash
+chmod +x uninstall.sh
+./uninstall.sh
+```
+
+Run it as your normal user (not root) — it uses sudo where needed. Use `--dry-run` to see what would be removed without changing anything, and `--yes` to skip the confirmation prompt.
+
+The uninstaller removes everything listed under [What gets installed](#what-gets-installed) below — the switching scripts, the Gaming Mode Wayland session, the Super+Alt+S shortcut, the display manager autologin drop-in, and all sudoers/polkit/udev/performance config. It also offers (optional, default no) to remove the two AUR packages that exist only for Gaming Mode (`gamescope-session-git`, `gamescope-session-steam-git`), your `autologin` group membership, and the `gaming-mode.conf` config file.
+
+Deliberately **left in place**, with how to revert each:
+
+| What | Why it's kept | To revert manually |
+|---|---|---|
+| Steam, gamescope, mangohud, gamemode, Vulkan drivers, python-evdev | Useful on their own; may predate this script | `sudo pacman -Rns <package>` |
+| Proton-GE in `~/.local/share/Steam/compatibilitytools.d/` | It's your Steam data | Delete the `GE-Proton*` folder |
+| `video`, `input`, `wheel` group memberships | Commonly needed outside gaming | `sudo gpasswd -d $USER <group>` |
+| `nvidia-drm.modeset=1` kernel parameter (NVIDIA only) | Harmless (often beneficial) on the desktop; bootloader edits are risky to automate | Restore the timestamped backup the installer made (`/etc/default/grub.backup.*`, `/etc/default/limine.backup.*`, or `/boot/loader/entries/*.backup.*`), then regenerate your bootloader config |
+| `[multilib]` pacman repo | Steam and other 32-bit software need it | Restore `/etc/pacman.conf.backup.*` or comment the `[multilib]` block out |
+
+After uninstalling, log out and back in (or reboot) to clear session environment variables and refresh the login screen's session list. If you use NetworkManager as your main network service, restart it (`sudo systemctl restart NetworkManager`) so it picks up its stock config again.
+
 ## What gets installed
 
 ### Packages (via pacman + AUR)
