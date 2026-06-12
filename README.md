@@ -49,8 +49,8 @@ This installer sets up a full console-like gaming experience on your KDE Plasma 
 ## Install
 
 ```bash
-git clone https://git.no-signal.uk/nosignal/super-alt-s.git
-cd super-alt-s
+git clone https://github.com/28allday/super-alt-S-cachy-deckmode.git
+cd super-alt-S-cachy-deckmode
 chmod +x super-alt-s.sh
 ./super-alt-s.sh
 ```
